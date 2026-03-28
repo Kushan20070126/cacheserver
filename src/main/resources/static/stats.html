@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Real-Time Cache Monitor</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root { --bg:#0f172a; --card:#1e293b; --text:#f1f5f9; --accent:#38bdf8; --err:#f43f5e; --warn:#fbbf24; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background:var(--bg); color:var(--text); padding:20px; margin:0; }
+
+        .header { display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:10px; margin-bottom:20px; }
+
+        .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:20px; }
+        .stat-card { background:var(--card); padding:20px; border-radius:12px; border: 1px solid #334155; }
+        .stat-val { font-size:2rem; font-weight:800; color:var(--accent); margin-top:5px; }
+
+        /* Progress Bar Styling */
+        .progress-container { margin-top:15px; background:#334155; height:12px; border-radius:10px; overflow:hidden; position:relative; }
+        #memory-bar {
+            height:100%; width:0%; background:var(--accent);
+            transition: width 0.5s ease-in-out, background 0.3s;
+        }
+        .progress-labels { display: flex; justify-content: space-between; margin-top: 5px; font-size: 0.85rem; color: #94a3b8; }
+
+        .chart-container { background:var(--card); padding:15px; border-radius:12px; margin-top:20px; height:350px; border: 1px solid #334155; }
+
+        #log-window {
+            background:#000; color:#10b981; font-family: 'Cascadia Code', monospace;
+            padding:15px; border-radius:8px; height:150px;
+            overflow-y:auto; margin-top:20px; font-size:12px; border: 1px solid #334155;
+        }
+
+        .log-err { color:var(--err); }
+        .status-tag { padding:6px 16px; border-radius:20px; font-size:12px; font-weight:bold; text-transform: uppercase; }
+        .online { background:#065f46; color:#34d399; }
+        .offline { background:#7f1d1d; color:#f87171; }
+
+        #warning { color:var(--err); font-weight:bold; display:none; margin-top: 5px; animation: blink 1s infinite; }
+        @keyframes blink { 50% { opacity: 0.5; } }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>Cache Live Monitor</h1>
+    <div id="status-indicator" class="status-tag offline">OFFLINE</div>
+</div>
+
+<div class="grid">
+    <div class="stat-card">
+        <div>Total Items</div>
+        <div id="items-val" class="stat-val">0</div>
+        <div style="color:#94a3b8; font-size:0.9rem; margin-top:5px;">Active objects in memory</div>
+    </div>
+
+    <div class="stat-card">
+        <div>Memory Usage</div>
+        <div id="memory-val" class="stat-val">0 B</div>
+
+        <div class="progress-container">
+            <div id="memory-bar"></div>
+        </div>
+        <div class="progress-labels">
+            <span id="memory-percent">0% Used</span>
+            <span id="warning">⚠ CACHE LIMIT REACHED</span>
+        </div>
+    </div>
+</div>
+
+<div class="chart-container">
+    <canvas id="liveChart"></canvas>
+</div>
+
+<h3>System Logs</h3>
+<div id="log-window"></div>
+
+<script>
+    const MAX_POINTS = 30;
+    const logWin = document.getElementById('log-window');
+    const statusTag = document.getElementById('status-indicator');
+    let lastEvictions = 0;
+
+    // Initialize Chart.js
+    const ctx = document.getElementById('liveChart').getContext('2d');
+    const chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                { label: 'Items', borderColor: '#38bdf8', data: [], tension: 0.2, fill: false },
+                { label: 'Memory (Bytes)', borderColor: '#fbbf24', data: [], tension: 0.2, yAxisID: 'y1' },
+                { label: 'Eviction Spike', borderColor: '#f43f5e', data: [], stepped: true, borderDash: [5,5] }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+                y: { beginAtZero: true, grid: { color: '#334155' } },
+                y1: { position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
+            },
+            plugins: { legend: { labels: { color: '#f1f5f9' } } }
+        }
+    });
+
+    function addLog(msg, isErr = false) {
+        const div = document.createElement('div');
+        if(isErr) div.className = 'log-err';
+        div.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        logWin.prepend(div);
+        if(logWin.children.length > 50) logWin.lastChild.remove();
+    }
+
+    async function fetchData() {
+        try {
+            // Try relative path first, fallback to absolute for local testing
+            const res = await fetch('/cache/stats').catch(() => fetch('http://localhost:8080/cache/stats'));
+            if(!res.ok) throw new Error('HTTP Error ' + res.status);
+
+            const data = await res.json();
+            updateUI(data);
+
+            statusTag.innerText = "ONLINE";
+            statusTag.className = "status-tag online";
+        } catch(e) {
+            statusTag.innerText = "OFFLINE";
+            statusTag.className = "status-tag offline";
+            addLog("Connection failed: " + e.message, true);
+        }
+    }
+
+    function updateUI(data) {
+        const items = data.currentItems || 0;
+        const memory = data.currentMemoryBytes || 0;
+
+        // 1. Update Text
+        document.getElementById('items-val').innerText = items.toLocaleString();
+        document.getElementById('memory-val').innerText = formatMemory(memory);
+
+        // 2. Fix Progress Bar Logic
+        // Use maxMemory from API if available, otherwise default to 10MB for scale
+        const maxMemory = data.maxMemoryBytes || (10 * 1024 * 1024);
+        let percent = (memory / maxMemory) * 100;
+        percent = Math.min(Math.max(percent, 0), 100); // Clamp between 0-100
+
+        const bar = document.getElementById('memory-bar');
+        bar.style.width = percent + '%';
+        document.getElementById('memory-percent').innerText = percent.toFixed(1) + '% of ' + formatMemory(maxMemory);
+
+        // 3. Warning Colors
+        if(percent > 85) {
+            bar.style.background = '#f43f5e'; // Red
+            document.getElementById('warning').style.display = 'inline';
+        } else if (percent > 60) {
+            bar.style.background = '#fbbf24'; // Yellow
+            document.getElementById('warning').style.display = 'none';
+        } else {
+            bar.style.background = '#38bdf8'; // Blue
+            document.getElementById('warning').style.display = 'none';
+        }
+
+        // 4. Chart & Evictions
+        const spike = (data.evictions > lastEvictions) ? (data.evictions - lastEvictions) : 0;
+        lastEvictions = data.evictions;
+
+        const time = new Date().toLocaleTimeString();
+        chart.data.labels.push(time);
+        chart.data.datasets[0].data.push(items);
+        chart.data.datasets[1].data.push(memory);
+        chart.data.datasets[2].data.push(spike);
+
+        if(chart.data.labels.length > MAX_POINTS) {
+            chart.data.labels.shift();
+            chart.data.datasets.forEach(d => d.data.shift());
+        }
+        chart.update();
+
+        addLog(`Pulse: ${items} items | ${formatMemory(memory)} | Evicts: ${data.evictions}`);
+    }
+
+    function formatMemory(bytes) {
+        if(bytes === 0) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    setInterval(fetchData, 2000);
+    fetchData(); // Initial load
+</script>
+
+</body>
+</html>
